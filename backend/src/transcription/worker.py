@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from audio_queue import AudioTaskQueue
-from transcription.wenet_transcriber import TranscriptionResult, WenetTranscriber
+from transcription.base import BaseTranscriber, TranscriptionResult
 
 
 ResultCallback = Callable[[TranscriptionResult], Awaitable[None]]
@@ -20,7 +20,11 @@ ResultCallback = Callable[[TranscriptionResult], Awaitable[None]]
 class TranscriptionWorker:
     """Consumes queued audio tasks and emits transcription results."""
 
-    def __init__(self, task_queue: AudioTaskQueue, transcriber: WenetTranscriber):
+    def __init__(
+        self,
+        task_queue: AudioTaskQueue,
+        transcriber: BaseTranscriber,
+    ):
         """Initializes the worker.
 
         Args:
@@ -41,7 +45,9 @@ class TranscriptionWorker:
         while True:
             task = await self.task_queue.get()
             try:
-                result = await asyncio.to_thread(self.transcriber.transcribe, task)
+                result = await asyncio.to_thread(
+                    self.transcriber.transcribe, task
+                )
                 await on_result(result)
             finally:
                 self.task_queue.task_done()

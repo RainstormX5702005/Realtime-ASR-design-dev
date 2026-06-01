@@ -1,12 +1,25 @@
 """Transcription package public exports."""
 
-from transcription.wenet_transcriber import TranscriptionConfig, TranscriptionResult, WenetTranscriber
+from transcription.base import (
+    BaseTranscriber,
+    RawTranscriptionResult,
+    TranscriptionResult,
+)
+from transcription.factory import TranscriberFactoryConfig, create_transcriber
+from transcription.subprocess_backend import (
+    SubprocessTranscriber,
+    SubprocessTranscriberConfig,
+)
 from transcription.worker import ResultCallback, TranscriptionWorker
 
 __all__ = [
+    "BaseTranscriber",
+    "RawTranscriptionResult",
     "ResultCallback",
-    "TranscriptionConfig",
     "TranscriptionResult",
     "TranscriptionWorker",
-    "WenetTranscriber",
+    "TranscriberFactoryConfig",
+    "SubprocessTranscriber",
+    "SubprocessTranscriberConfig",
+    "create_transcriber",
 ]

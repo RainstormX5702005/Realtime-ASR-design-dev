@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import numpy as np
@@ -7,11 +7,15 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from silero_vad import VADIterator, load_silero_vad
-from wenet.cli.model import load_model
 
+from asr_logging import AsrLogConfig, AsrResultLogger
 from audio_queue import AudioTaskQueue, build_audio_tasks
 from preprocess import PreprocessPipeline
-from transcription import TranscriptionWorker, WenetTranscriber
+from transcription import (
+    TranscriberFactoryConfig,
+    TranscriptionWorker,
+    create_transcriber,
+)
 
 CHANNELS = 1
 SAMPLE_RATE = 16000
@@ -21,15 +25,42 @@ PREV_CHUNKS = int(0.3 * SAMPLE_RATE / CHUNK_SIZE)
 
 SRC_DIR = Path(__file__).resolve().parent
 MODEL_DIR = SRC_DIR.parent / "models"
+SCRIPT_DIR = SRC_DIR.parent / "scripts"
+LOG_DIR = SRC_DIR.parent / "logs"
 
-app = FastAPI()
 
-print("Loading SenseVoice model...")
-model = load_model(str(MODEL_DIR), device="cuda")
-print("Model loaded.")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asr_logger = AsrResultLogger(AsrLogConfig(log_dir=LOG_DIR))
+    await asr_logger.start()
+    app.state.asr_logger = asr_logger
+    transcriber = None
 
-vad_model = load_silero_vad()
-print("VAD loaded.")
+    try:
+        transcriber = create_transcriber(
+            TranscriberFactoryConfig(
+                backend="wenet",
+                model_dir=MODEL_DIR,
+                device="cuda",
+                beam_size=10,
+                script_path=SCRIPT_DIR / "wenet_serve.sh",
+            )
+        )
+        app.state.transcriber = transcriber
+        asr_logger.record_event("transcriber_ready", backend="wenet")
+
+        app.state.vad_model = load_silero_vad()
+        asr_logger.record_event("vad_ready")
+
+        yield
+    finally:
+        if transcriber is not None:
+            transcriber.close()
+            asr_logger.record_event("transcriber_closed", backend="wenet")
+        await asr_logger.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.websocket("/ws")
@@ -37,16 +68,21 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
 
     preprocess = PreprocessPipeline()
-    vad_iter = VADIterator(vad_model, **preprocess.vad_kwargs)
+    vad_iter = VADIterator(ws.app.state.vad_model, **preprocess.vad_kwargs)
     task_queue = AudioTaskQueue()
-    transcriber = WenetTranscriber(model)
-    worker = TranscriptionWorker(task_queue, transcriber)
+    worker = TranscriptionWorker(task_queue, ws.app.state.transcriber)
 
     async def send_result(result):
         """Sends successful transcription text to the current WebSocket."""
 
+        ws.app.state.asr_logger.record_result(result)
         if result.error:
-            print(f"Transcription failed: {result.error}")
+            ws.app.state.asr_logger.record_event(
+                "transcription_error",
+                segment_id=result.segment_id,
+                window_index=result.window_index,
+                error=result.error,
+            )
             return
         if result.text:
             await ws.send_text(result.text)
@@ -81,9 +117,9 @@ async def websocket_endpoint(ws: WebSocket):
             if speech_dict and "end" in speech_dict:
                 speaking = False
                 raw_audio = np.concatenate(prev_audio_chunks + audio_chunks)
-                noise_reference = (
-                    np.concatenate(prev_audio_chunks) if prev_audio_chunks else None
-                )
+                noise_reference = None
+                if prev_audio_chunks:
+                    noise_reference = np.concatenate(prev_audio_chunks)
                 audio_chunks = []
 
                 prepared = preprocess.process_segment(
@@ -105,7 +141,11 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 static_dir = SRC_DIR / "static"
-app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+app.mount(
+    "/",
+    StaticFiles(directory=str(static_dir), html=True),
+    name="static",
+)
 
 
 if __name__ == "__main__":
